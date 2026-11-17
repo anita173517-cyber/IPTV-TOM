@@ -1,0 +1,253 @@
+name: StreamX Media3 Pro v12.5 Ultra-Zap 3D Single Release APK Build
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-single-release-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Locate & Extract Project ZIP Safely (Zero Duplicate Copy)
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          TARGET_ZIP=""
+          for candidate in *v12.5*.zip *Ultra_Zap*.zip *.zip; do
+            if [ -f "$candidate" ]; then
+              TARGET_ZIP="$candidate"
+              break
+            fi
+          done
+
+          if [ -n "$TARGET_ZIP" ]; then
+            echo "Found project archive: $TARGET_ZIP"
+            STAGE_DIR="$(mktemp -d)"
+            unzip -q "$TARGET_ZIP" -d "$STAGE_DIR"
+
+            PROJECT_ROOT=""
+            if [ -f "$STAGE_DIR/settings.gradle.kts" ] && [ -f "$STAGE_DIR/app/build.gradle.kts" ]; then
+              PROJECT_ROOT="$STAGE_DIR"
+            elif [ -f "$STAGE_DIR/iptv_media3_pro_android_tv/settings.gradle.kts" ] && [ -f "$STAGE_DIR/iptv_media3_pro_android_tv/app/build.gradle.kts" ]; then
+              PROJECT_ROOT="$STAGE_DIR/iptv_media3_pro_android_tv"
+            else
+              FOUND_SETTINGS="$(find "$STAGE_DIR" -maxdepth 3 -name "settings.gradle.kts" | head -n 1 || true)"
+              if [ -n "$FOUND_SETTINGS" ]; then
+                PROJECT_ROOT="$(dirname "$FOUND_SETTINGS")"
+              fi
+            fi
+
+            if [ -z "$PROJECT_ROOT" ] || [ ! -f "$PROJECT_ROOT/app/build.gradle.kts" ]; then
+              echo "ERROR: Invalid ZIP structure in '$TARGET_ZIP'. Could not find 'settings.gradle.kts' and 'app/build.gradle.kts'."
+              exit 1
+            fi
+
+            echo "Syncing verified project root from: $PROJECT_ROOT"
+            cp -rf "$PROJECT_ROOT"/. .
+            rm -rf "$STAGE_DIR"
+          else
+            echo "No ZIP file found in root; checking existing repository structure..."
+            if [ -d "iptv_media3_pro_android_tv" ] && [ ! -f "settings.gradle.kts" ]; then
+              cp -rf iptv_media3_pro_android_tv/. .
+            fi
+          fi
+
+          for req_file in \
+            "settings.gradle.kts" \
+            "build.gradle.kts" \
+            "gradle.properties" \
+            "app/build.gradle.kts" \
+            "app/proguard-rules.pro" \
+            "app/src/main/AndroidManifest.xml" \
+            "scripts/verify_project.py"; do
+            if [ ! -f "$req_file" ]; then
+              echo "ERROR: Incomplete project structure. Missing required file: $req_file"
+              exit 1
+            fi
+          done
+          echo "PASS: Project root structure verified."
+
+      - name: 3. Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 4. Verify Android SDK & Build-Tools Environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT" ]; then
+            echo "ERROR: ANDROID_HOME / ANDROID_SDK_ROOT is not configured on this runner."
+            exit 1
+          fi
+          echo "Using Android SDK at: $SDK_ROOT"
+
+          BUILD_TOOLS_DIR="$(find "$SDK_ROOT/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1 || true)"
+          if [ -z "$BUILD_TOOLS_DIR" ] || [ ! -x "$BUILD_TOOLS_DIR/apksigner" ] || [ ! -x "$BUILD_TOOLS_DIR/aapt" ]; then
+            echo "ERROR: Android SDK build-tools (apksigner / aapt) not found under $SDK_ROOT/build-tools."
+            exit 1
+          fi
+          echo "ANDROID_BUILD_TOOLS=$BUILD_TOOLS_DIR" >> "$GITHUB_ENV"
+          echo "Found Android Build-Tools: $BUILD_TOOLS_DIR"
+
+          if [ -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+            yes | "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          fi
+
+      - name: 5. Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+
+      - name: 6. Configure & Verify Release Signing
+        shell: bash
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "$RELEASE_KEYSTORE_BASE64" ] && [ -n "$RELEASE_KEYSTORE_PASSWORD" ] && [ -n "$RELEASE_KEY_ALIAS" ] && [ -n "$RELEASE_KEY_PASSWORD" ]; then
+            KEYSTORE_FILE="$RUNNER_TEMP/streamx-release.jks"
+            echo "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_FILE"
+            if [ ! -s "$KEYSTORE_FILE" ]; then
+              echo "ERROR: Decoded RELEASE_KEYSTORE_BASE64 is empty or invalid."
+              exit 1
+            fi
+            echo "SIGNING_STORE_FILE=$KEYSTORE_FILE" >> "$GITHUB_ENV"
+            echo "SIGNING_STORE_PASSWORD=$RELEASE_KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "SIGNING_KEY_ALIAS=$RELEASE_KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "SIGNING_KEY_PASSWORD=$RELEASE_KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "PASS: Using production Release Keystore from GitHub Secrets."
+          else
+            mkdir -p "$HOME/.android"
+            if [ ! -f "$HOME/.android/debug.keystore" ]; then
+              keytool -genkeypair -v \
+                -keystore "$HOME/.android/debug.keystore" \
+                -storepass android \
+                -alias androiddebugkey \
+                -keypass android \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
+            if ! grep -q "signingConfig" app/build.gradle.kts; then
+              echo "ERROR: No signingConfig configured for release buildType in app/build.gradle.kts."
+              exit 1
+            fi
+            echo "PASS: Verified active Android Release Signing configuration."
+          fi
+
+      - name: 7. Run Project Structural & Resource Verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/verify_project.py
+
+      - name: 8. Run JVM Unit Tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle testDebugUnitTest --stacktrace --no-daemon
+
+      - name: 9. Build Single Final Release APK Only (No Debug APK)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf app/build/outputs/apk
+          gradle assembleRelease --stacktrace --no-daemon
+
+      - name: 10. Strict Final APK Audit (Count, Size, Package ID, Version & Signature)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Ensure zero Debug APKs exist
+          DEBUG_COUNT="$(find app/build/outputs/apk/debug -type f -name "*.apk" 2>/dev/null | wc -l || true)"
+          if [ "$DEBUG_COUNT" -ne 0 ]; then
+            echo "ERROR: Found $DEBUG_COUNT unexpected Debug APK(s). Only 1 Release APK is permitted."
+            exit 1
+          fi
+
+          # Ensure strictly ONE Release APK was produced
+          mapfile -t APK_FILES < <(find app/build/outputs/apk/release -type f -name "*.apk" | sort)
+          APK_COUNT="${#APK_FILES[@]}"
+          if [ "$APK_COUNT" -ne 1 ]; then
+            echo "ERROR: Expected exactly 1 Release APK, but found $APK_COUNT."
+            find app/build/outputs/apk -type f || true
+            exit 1
+          fi
+
+          RELEASE_APK="${APK_FILES[0]}"
+          echo "Found single Release APK: $RELEASE_APK"
+
+          if [[ "$RELEASE_APK" == *"unsigned"* ]]; then
+            echo "ERROR: APK '$RELEASE_APK' is unsigned! Failing build."
+            exit 1
+          fi
+
+          # Check non-empty and minimum realistic size (> 1 MB)
+          APK_BYTES="$(stat -c%s "$RELEASE_APK")"
+          if [ "$APK_BYTES" -lt 1000000 ]; then
+            echo "ERROR: Release APK size ($APK_BYTES bytes) is abnormally small or corrupted."
+            exit 1
+          fi
+
+          # Check ZIP/APK archive integrity
+          unzip -t "$RELEASE_APK" > /dev/null
+          echo "PASS: APK archive integrity verified ($APK_BYTES bytes)."
+
+          # Check Package ID, Version & SDK Compatibility via aapt
+          BADGING="$("$ANDROID_BUILD_TOOLS/aapt" dump badging "$RELEASE_APK")"
+          echo "$BADGING" | grep -E "package: name=|sdkVersion:|targetSdkVersion:"
+
+          if ! echo "$BADGING" | grep -q "name='com.harindra.iptvpro'"; then
+            echo "ERROR: APK package ID does not match 'com.harindra.iptvpro'."
+            exit 1
+          fi
+          if ! echo "$BADGING" | grep -q "sdkVersion:'23'"; then
+            echo "ERROR: APK minSdkVersion does not match 23."
+            exit 1
+          fi
+
+          # Cryptographic Signature Verification via apksigner
+          "$ANDROID_BUILD_TOOLS/apksigner" verify --verbose --print-certs "$RELEASE_APK"
+          echo "PASS: Cryptographic APK signature verified via apksigner."
+
+          # Stage strictly 1 APK for upload
+          rm -rf single_release_out
+          mkdir -p single_release_out
+          FINAL_APK="single_release_out/StreamX-Media3-Pro-v12.5-UltraZap3D-Release.apk"
+          cp "$RELEASE_APK" "$FINAL_APK"
+
+          STAGED_COUNT="$(find single_release_out -type f -name "*.apk" | wc -l)"
+          if [ "$STAGED_COUNT" -ne 1 ]; then
+            echo "ERROR: Staging folder must contain exactly 1 APK, found $STAGED_COUNT."
+            exit 1
+          fi
+
+          awk "BEGIN {printf \"PASS: Final Signed Release APK Size: %.2f MB (%d bytes)\n\", $APK_BYTES / (1024*1024), $APK_BYTES}"
+          sha256sum "$FINAL_APK"
+
+      - name: 11. Upload Single Verified Release APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StreamX-Media3-Pro-v12.5-UltraZap3D-Single-Release
+          path: single_release_out/StreamX-Media3-Pro-v12.5-UltraZap3D-Release.apk
+          if-no-files-found: error
+          overwrite: true
+          
